@@ -1,0 +1,452 @@
+#Автономность: Весь цикл от розжига до охлаждения прописан внутри script, что гарантирует его завершение даже при разрыве Wi-Fi соединения.
+#LEDC PWM: Использование ledc на ESP32 обеспечивает тихую работу вентилятора (20 кГц) и эффективное управление свечой.
+#Безопасность: Добавлен 5-секундный фильтр на срыв пламени, чтобы избежать ложных срабатываний из-за шумов ACS712, и жесткий триггер на 92°C.
+#Помпа: Учтено управление циркуляционным насосом, который продолжает работать весь период охлаждения.
+# Для реализации этого проекта на ESP32 требуется силовая развязка, так как компоненты Webasto (свеча, помпа, вентилятор) потребляют большие токи (до 15–20А в пике), а ESP32 работает на 3.3В с микротоками.
+# 1. Основные силовые компоненты
+# Свеча накала (Glow Plug): Нужен мощный N-канальный MOSFET с логическим управлением (Logic Level), способный выдержать 20А+.
+# Рекомендую: IRLB3034 или AUIRLXB3034. Они полностью открываются от 3.3В. Обязательно на радиатор.
+# Вентилятор (Fan): MOSFET на 5–10А.
+# Рекомендую: IRLZ44N.
+# Топливный насос и Помпа ОЖ: Можно использовать MOSFET попроще (например, AO3400 для SMD или IRLZ44N) или обычные автомобильные реле (через транзисторный ключ BC547).
+# 2. Схема подключения (Распиновка ESP32)
+# Компонент Webasto	Тип сигнала	GPIO ESP32	Схема подключения
+# Свеча накала	PWM (LEDC)	GPIO 21	Через IRLB3034. Затвор (Gate) к GPIO через резистор 100 Ом.
+# Вентилятор	PWM (LEDC)	GPIO 22	Через IRLZ44N. Обязательно диод (1N4007) параллельно мотору.
+# Топливный насос	Импульс	GPIO 19	MOSFET или Реле.
+# Помпа ОЖ	Вкл/Выкл	GPIO 18	Реле или MOSFET.
+# NTC Датчик темп.	Аналог	GPIO 32	Делитель напряжения: 3.3V -> NTC -> GPIO32 -> Резистор 10k -> GND.
+# Датчик тока (Flame)	Аналог	GPIO 35	Выход модуля ACS712 (20A). Питание модуля 5V, выход через делитель к ESP32.
+# 3. Специфические узлы (Важно!)
+# Датчик пламени (ACS712)
+# Модуль ACS712 выдает 0–5В. ESP32 принимает максимум 3.3В.
+# Решение: Между выходом ACS712 и GPIO35 поставьте делитель: резистор 2кОм (от ACS) и 3.3кОм (на GND).
+# Логика: Мы меряем ток свечи. Когда солярка вспыхивает, свеча нагревается сильнее, её сопротивление растет, а ток падает. Это и есть сигнал "пламя есть".
+# Датчик температуры (NTC)
+# Штатный датчик Webasto — это обычно NTC термистор 10кОм.
+# Подключите его в плечо делителя. Для точности в ESPHome используйте attenuation: 11db для ADC.
+# Питание схемы
+# Вход: 12В от аккумулятора.
+# Для ESP32: Используйте надежный DC-DC преобразователь (например, на базе LM2596 или MP1584), понижающий до 5В. Внутренний стабилизатор ESP32 сделает 3.3В.
+# Защита: Поставьте предохранитель 20А на общую линию 12В.
+# 4. Рекомендации по сборке
+# Общая земля (GND): Силовая земля (минус свечи, вентилятора) и земля ESP32 должны сходиться в одной точке ("звезда"), чтобы мощные токи не вызывали помех на процессоре.
+# Обратные диоды: Параллельно вентилятору, помпе и топливному насосу ОБЯЗАТЕЛЬНО поставьте защитные диоды (катодом к +12В), иначе индуктивный выброс сожжет транзисторы.
+# Оптическая развязка (Опционально): В идеале управлять затворами MOSFET через оптопары (например, PC817), чтобы полностью изолировать ESP32 от помех в бортовой сети авто.
+# Конденсаторы: Поставьте электролитический конденсатор 2200мкФ 25В по линии 12В максимально близко к MOSFET свечи накала.
+# Итог по деталям:
+# ESP32 WROOM-32E — 1 шт.
+# Модуль ACS712 (20A) — 1 шт.
+# MOSFET IRLB3034 (Свеча) — 1 шт.
+# MOSFET IRLZ44N (Вентилятор/Помпа) — 3 шт.
+# DC-DC 12V -> 5V — 1 шт.
+# Резисторы (100 Ом, 10кОм, 2кОм, 3.3кОм) — набор.
+# Диоды 1N4007 — 3-4 шт.
+# Схема строится вокруг ESP32 WROOM-32E. Все силовые нагрузки подключаются через N-канальные MOSFET-транзисторы.
+# 1. Силовой блок (Управление 12В нагрузками)
+# Все MOSFET подключаются по стандартной схеме: GPIO -> Резистор 100 Ом -> Gate (Затвор). Истоки (Source) всех транзисторов соединяются с общей землей (GND).
+# Свеча накала (Glow Plug): GPIO 21 -> IRLB3034 (на радиаторе). Нагрузка (свеча) подключается между +12В и Drain (Стоком).
+# Вентилятор (Fan): GPIO 22 -> IRLZ44N. Обязательно защитный диод (1N4007) параллельно мотору.
+# Топливный насос: GPIO 19 -> IRLZ44N (или реле через BC547).
+# Циркуляционная помпа ОЖ: GPIO 18 -> IRLZ44N (или реле).
+# 2. Измерительный блок (Сенсоры)
+# Датчик пламени (Ток свечи): Модуль ACS712 (20A) включается в разрыв провода свечи накала.
+# Питание модуля: 5В (Vin).
+# Выход (OUT) -> Делитель напряжения (2кОм к OUT, 3.3кОм к GND) -> GPIO 35. Это необходимо для согласования уровней 5В -> 3.3В.
+# Температура воды (NTC): Штатный датчик Webasto (10кОм).
+# Схема: 3.3В -> NTC -> GPIO 32 -> Резистор 10кОм -> GND. Рекомендуется конденсатор 0.1мкФ на GPIO 32 для снижения шумов.
+# 3. Питание и защита
+# DC-DC преобразователь: 12В (АКБ) -> 5В (Step-Down, напр. MP1584). 5В подается на контакт Vin ESP32 и питание ACS712.
+# Общая земля: Силовая "земля" от свечи и логическая "земля" ESP32 должны сходиться в одной точке во избежание помех.
+# Предохранитель: На общий вход 12В установите автомобильный предохранитель на 20А.
+# Дополнительные компоненты
+# MOSFETы с логическим уровнем (Logic Level): IRLB3034 или IRLZ44N критичны, так как обычные транзисторы (типа IRFZ44N) не откроются полностью от 3.3В ESP32.
+# Радиаторы: Свеча накала при прогреве потребляет до 15-20А, поэтому её транзистор требует эффективного охлаждения.
+# Конденсаторы: Электролит 1000-2200мкФ на входе 12В поможет сгладить скачки напряжения при работе свечи и насоса.
+
+
+substitutions:
+
+  # Назначение пинов (GPIO)
+  pin_glow_plug: GPIO14    # Свеча накала (PWM)
+  pin_fan: GPIO27          # Вентилятор (PWM)
+  pin_fuel_pump: GPIO26    # Топливный насос
+  pin_water_pump: GPIO25   # Водяная помпа (Кулант)
+  pin_ntc_sensor: GPIO34   # Датчик температуры (ADC)
+  pin_flame_sensor: GPIO35 # Датчик пламени/тока (ADC)
+
+
+api:
+  encryption:
+    key: "ca7WCCr8mDjBsvHs1HeXCEHYdvVlAC0lSWBUuAyuftY="
+
+ota:
+  - platform: esphome
+    password: "9c1d4675861c77e39ee587e6db56c32d"  
+
+safe_mode:
+
+wifi:
+  ssid: "home12345"
+  password: "07530753"
+  use_address: 192.168.117.113
+#  ssid: !secret wifi_ssid
+#  password: !secret wifi_password
+#  use_address: 192.168.1.124
+  ap:
+    ssid: "webasto-esp32-2"
+    password: "12345678"
+    ap_timeout: 5s  
+
+#captive_portal:
+
+web_server:
+  local: true
+
+
+
+
+esphome:
+  name: esp32-2
+  friendly_name: ESP32_2
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+    version: recommended
+
+# ОБЯЗАТЕЛЬНО: Активация логгера
+logger:
+  level: DEBUG                                                         
+
+
+# Глобальные переменные для управления состояниями и модуляцией
+globals:
+  - id: heater_state
+    type: int
+    initial_value: '0' # 0:OFF, 1:PREHEAT, 2:IGNITION, 3:RUNNING, 4:COOLING, 5:ERROR
+  - id: fuel_freq
+    type: float
+    initial_value: '1.2'
+  - id: fan_speed
+    type: float
+    initial_value: '0.2'
+  - id: ignite_fail_count
+    type: int
+    initial_value: '0'
+  - id: temp_at_start
+    type: float
+    initial_value: '0.0'
+  - id: ignition_start_time
+    type: uint32
+    initial_value: '0'
+# Выходы
+output:
+  - platform: ledc
+    pin: ${pin_glow_plug}
+    id: glow_plug_pwm
+    frequency: 500Hz
+  - platform: ledc
+    pin: ${pin_fan}
+    id: fan_pwm
+    frequency: 20000Hz
+  - platform: gpio
+    pin: ${pin_fuel_pump}
+    id: fuel_pump_output
+  # - platform: gpio
+    # pin: ${pin_water_pump}
+    # id: water_pump_output
+
+# Бинарные выходы для HA
+switch:
+
+  - platform: template
+    name: "Webasto Master Switch"
+    id: heater_switch
+    icon: "mdi:fire"
+    # Оптимистичный режим позволяет кнопке менять состояние сразу при нажатии
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    
+    # В template switch используются эти названия блоков для действий:
+    turn_on_action:
+      - script.execute: start_sequence
+    turn_off_action:
+      - script.execute: stop_sequence
+
+  - platform: gpio
+    pin: ${pin_water_pump}
+    id: coolant_pump
+    internal: true
+
+# Датчики
+sensor:
+  # 1. Физический датчик (Исправлено attenuation и ID)
+  - platform: adc
+    id: water_temp_adc
+    pin: ${pin_ntc_sensor}
+    attenuation: 12db  # Исправлено на 12db для 2025 года
+    update_interval: 1s
+
+          
+  - platform: template
+    id: water_temp_test
+    name: "Water Temperature Test"
+    unit_of_measurement: "V" # Временно смотрим в Вольтах
+    lambda: return id(water_temp_adc).state;
+
+  # 2. Переводим вольты в Омы (для делителя 10к на 3.3В и 10к на GND)
+  - platform: template
+    id: water_temp_resistance
+    lambda: |-
+      float v_out = id(water_temp_adc).state;
+      if (v_out >= 3.25 || v_out <= 0.05) return NAN; // Защита от КЗ и обрыва
+      // Формула делителя: R2 = R1 * (Vout / (Vin - Vout))
+      return 10000.0 * (v_out / (3.3 - v_out));
+
+  # 3. Вычисляем температуру из полученных Омов
+  - platform: ntc
+    id: water_temp
+    sensor: water_temp_resistance
+    calibration:
+      b_constant: 3950
+      reference_resistance: 10kOhm
+      reference_temperature: 25°C
+    name: "Water Temperature"
+    on_value_range:
+      - above: 92.0
+        then:
+          - logger.log:
+              level: ERROR
+              format: "OVERHEAT DETECTED!"
+          - script.execute: emergency_shutdown
+  # 4. Датчик пламени
+  - platform: adc
+    pin: ${pin_flame_sensor}
+    id: flame_current
+    name: "Glow Plug Current"
+    attenuation: 12db  # Исправлено на 12db
+    update_interval: 0.5s
+    filters:
+      - sliding_window_moving_average:
+          window_size: 15
+          send_every: 1
+
+  - platform: template
+    name: "Current Fan Speed"
+    unit_of_measurement: "%"
+    update_interval: 1s
+    accuracy_decimals: 1
+    lambda: "return id(fan_speed);"
+
+  - platform: template
+    name: "Heater State Code"
+    icon: "mdi:state-machine"
+    update_interval: 1s
+    accuracy_decimals: 0
+    lambda: "return id(heater_state);"
+
+  - platform: template
+    name: "Fuel Frequency"
+    unit_of_measurement: "Hz"
+    update_interval: 1s
+    lambda: |-
+      // Если состояние не Розжиг (2) и не Работа (3), показываем 0
+      if (id(heater_state) == 2 || id(heater_state) == 3) {
+        return id(fuel_freq);
+      } else {
+        return 0.0f;
+      }
+
+  - platform: template
+    name: "Ignite Fail Count"
+    icon: "mdi:alert-counter"
+    update_interval: 5s
+    accuracy_decimals: 0
+    lambda: "return id(ignite_fail_count);"
+
+
+
+
+# Интервальная логика для насоса, контроля пламени и безопасности
+interval:
+  - interval: 50ms
+    then:
+      - lambda: |-
+          // --- 1. ЗАЩИТА ПО ТЕМПЕРАТУРЕ ---
+          // На столе ADC может давать NaN или 1600. 
+          // Если планируете тесты без датчика, временно измените 92.0 на 2000.0
+          if (id(water_temp).state > 92.0 || std::isnan(id(water_temp).state)) {
+            if (id(heater_state) != 0 && id(heater_state) != 4 && id(heater_state) != 5) {
+              ESP_LOGE("safety", "OVERHEAT OR SENSOR ERROR! Temp: %.1f", id(water_temp).state);
+              id(heater_switch).turn_off(); 
+              id(heater_state) = 5;         
+            }
+          }
+
+          // --- 2. УПРАВЛЕНИЕ ЩЕЛЧКАМИ НАСОСА ---
+          static uint32_t last_pump = 0;
+          static bool pump_is_on = false;
+
+          if (id(heater_state) == 2 || id(heater_state) == 3) {
+            uint32_t now = millis();
+            if (now - last_pump >= (1000.0 / id(fuel_freq))) {
+              id(fuel_pump_output).turn_on();
+              last_pump = now;
+              pump_is_on = true;
+            }
+          }
+
+          if (pump_is_on && (millis() - last_pump >= 50)) {
+            id(fuel_pump_output).turn_off();
+            pump_is_on = false;
+          } // <--- ВОТ ЭТА СКОБКА БЫЛА ПРОПУЩЕНА
+
+          // --- 3. КОНТРОЛЬ СРЫВА ПЛАМЕНИ ---
+          if (id(heater_state) == 3) {
+            static int flame_loss_ticks = 0;
+            if (id(flame_current).state > 2.2) {
+              flame_loss_ticks++;
+              if (flame_loss_ticks > 20) {
+                 ESP_LOGW("safety", "FLAME LOSS DETECTED!");
+                 id(heater_switch).turn_off(); 
+                 flame_loss_ticks = 0;
+              }
+            } else { 
+              flame_loss_ticks = 0; 
+            }
+          }
+          // --- 4. ЗАЩИТА: КОНТРОЛЬ ПОДЪЕМА ТЕМПЕРАТУРЫ ---
+          // Проверяем только если мы в состоянии 2 (розжиг) или 3 (работа)
+          if (id(heater_state) == 2 || id(heater_state) == 3) {
+            uint32_t work_time = millis() - id(ignition_start_time);
+            
+            // Если прошло более 180 секунд (3 минуты)
+            if (work_time > 180000) { 
+              float temp_diff = id(water_temp).state - id(temp_at_start);
+              
+              if (temp_diff < 2.0) { // Если нагрев меньше 2 градусов
+                ESP_LOGE("safety", "IGNITION TIMEOUT: No temperature rise! (Diff: %.1f°C)", temp_diff);
+                id(heater_switch).turn_off(); // Выключаем и идем на продувку
+                id(heater_state) = 5;         // Устанавливаем ошибку
+              }
+            }
+          } else {
+            // Если вебасто выключена, сбрасываем стартовую температуру
+            id(temp_at_start) = 0;
+          }
+
+# Скрипты управления (Core Logic)
+script:
+  - id: start_sequence
+    mode: restart
+    then:
+      - logger.log: "WEB-START: Initializing..."
+      - switch.turn_on: coolant_pump
+      - lambda: 'id(heater_state) = 1;'
+      - output.set_level: { id: fan_pwm, level: 0.15 }
+                     
+                     
+      - output.set_level: { id: glow_plug_pwm, level: 0.85 }
+                           
+                     
+      - delay: 45s
+      
+      - logger.log: "WEB-START: Ignition phase..."
+      - lambda: |-
+          id(heater_state) = 2;
+          id(temp_at_start) = id(water_temp).state; // Запоминаем текущую температуру
+          id(ignition_start_time) = millis();       // Запоминаем время начала
+      - delay: 10s
+      - wait_until:
+          condition:
+            lambda: 'return id(flame_current).state < 1.7;'
+          timeout: 70s
+      
+      - if:
+          condition:
+            lambda: 'return id(flame_current).state < 1.7;'
+          then:
+            - logger.log: "WEB-START: Running mode active"
+            - lambda: |-
+                id(heater_state) = 3;
+                id(ignite_fail_count) = 0;
+            - output.set_level: { id: glow_plug_pwm, level: 0.0 }
+          else:
+                         
+                            
+            - logger.log: { level: ERROR, format: "WEB-START: Ignition Failed!" }
+            - lambda: 'id(ignite_fail_count)++;'
+            - script.execute: stop_sequence
+
+  - id: stop_sequence
+    mode: restart
+    then:
+      - logger.log: "WEB-STOP: Cooling cycle..."
+      - lambda: 'id(heater_state) = 4;'
+      - output.set_level: { id: glow_plug_pwm, level: 0.0 }
+      - output.set_level: { id: fan_pwm, level: 1.0 }
+      - delay: 150s
+      - output.set_level: { id: fan_pwm, level: 0.0 }
+      - switch.turn_off: coolant_pump
+      - lambda: 'id(heater_state) = 0;'
+      - logger.log: "WEB-STOP: System Idle"
+
+  - id: emergency_shutdown
+    mode: restart
+    then:
+                   
+                      
+      - logger.log: { level: ERROR, format: "EMERGENCY SHUTDOWN!" }
+      - lambda: 'id(heater_state) = 5;'
+      - output.set_level: { id: glow_plug_pwm, level: 0.0 }
+      - output.set_level: { id: fan_pwm, level: 1.0 }
+      - delay: 180s
+      - output.set_level: { id: fan_pwm, level: 0.0 }
+      - switch.turn_off: coolant_pump
+# Текстовый статус
+text_sensor:
+  - platform: template
+    name: "Heater Status"
+    lambda: |-
+      switch(id(heater_state)) {
+        case 1: return {"Нагрев свечи"};
+        case 2: return {"Розжиг"};
+        case 3: return {"Работа"};
+        case 4: return {"Охлаждение"};
+        case 5: return {"ОШИБКА/ПЕРЕГРЕВ"};
+        default: return {"Выключен"};
+      }
+
+# Выбор мощности
+select:
+  - platform: template
+    name: "Target Power"
+    id: target_power_select
+    options: ["Low", "Medium", "High"]
+    initial_option: "Medium"
+    optimistic: true  # <--- Добавьте эту строку
+    on_value:
+      then:
+        - lambda: |-
+            if (x == "Low") { 
+              id(fuel_freq) = 1.2; 
+              id(fan_speed) = 0.3; 
+            }
+            else if (x == "Medium") { 
+              id(fuel_freq) = 2.8; 
+              id(fan_speed) = 0.5; 
+            }
+            else if (x == "High") { 
+              id(fuel_freq) = 5.0; 
+              id(fan_speed) = 0.9; 
+            }
+
+            
+            // Если горелка уже работает (state 3), 
+            // немедленно обновляем скорость вентилятора
+            if (id(heater_state) == 3) {
+              // Для глобальных переменных .state не нужен, пишем просто id(имя)
+              id(fan_pwm).set_level(id(fan_speed));
+            }
