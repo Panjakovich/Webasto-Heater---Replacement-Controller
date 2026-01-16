@@ -87,12 +87,10 @@ ota:
 safe_mode:
 
 wifi:
-  ssid: "home12345"
-  password: "07530753"
-  use_address: 192.168.117.113
-#  ssid: !secret wifi_ssid
-#  password: !secret wifi_password
-#  use_address: 192.168.1.124
+
+ ssid: !secret wifi_ssid
+ password: !secret wifi_password
+ #use_address: 192.168.1.124
   ap:
     ssid: "webasto-esp32-2"
     password: "12345678"
@@ -450,3 +448,4 @@ select:
               // Для глобальных переменных .state не нужен, пишем просто id(имя)
               id(fan_pwm).set_level(id(fan_speed));
             }
+
