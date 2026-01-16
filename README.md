@@ -1,9 +1,9 @@
 # Webasto-Heater---Replacement-Controller
-An Arduino M0 based controller for Webasto C/E Diesel Water Heaters
+An ESP32C WROOM ESPRESSIF based controller for Webasto C/E Diesel Water Heaters
+Conseption remake from SimonRafferty and adopted for ESPHOME YAML code together with AI 
 
-PCB here: https://oshwlab.com/SimonRafferty/webasto-controller
-
-# Important Note:
+#original SimonRafferty description:
+Important Note:
 If you can, use the original plastic encapsulated thermistor to measure the water temperature.  After market, non encapsulated, thermistors change value when you squash them.  The spring clip which holds the thermistor against the heater body is enough to make the water temperature readings change significantly.
 I discovered this in the middle of the night, in a freezing camper van - and fixed it temporarily by bending the sides of the spring clip to bridge over the thermistor, not applying pressure on it.  The next day, I replaced it with the one off the original board - better solution.
 #
